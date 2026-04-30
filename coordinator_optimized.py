@@ -1,4 +1,4 @@
-"""The ukraine_alarm component."""
+"""The ukraine_alarm component - Enhanced version with alert index optimization."""
 
 from __future__ import annotations
 
@@ -41,6 +41,8 @@ class UkraineAlarmDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.uasiren = Client(session)
         # Зберігаємо історію тривог для відстеження часу початку
         self._alert_history: dict[str, dict[str, Any]] = {}
+        # Зберігаємо останній індекс для оптимізації
+        self._last_alert_index: int | None = None
 
         super().__init__(
             hass,
@@ -58,12 +60,40 @@ class UkraineAlarmDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.update_interval,
         )
 
+        # Спочатку перевіряємо чи змінився індекс тривог (легкий запит)
+        try:
+            status = await self.uasiren.get_last_alert_index()
+            current_index = status.get("lastActionIndex")
+            
+            # Якщо індекс не змінився, повертаємо попередні дані
+            if (
+                self._last_alert_index is not None
+                and current_index == self._last_alert_index
+                and self.data
+            ):
+                _LOGGER.debug(
+                    "Alert index unchanged (%s), skipping full update",
+                    current_index,
+                )
+                # Оновлюємо тривалість для активних тривог
+                return self._update_durations()
+            
+            self._last_alert_index = current_index
+            _LOGGER.debug("Alert index changed to %s, fetching full data", current_index)
+            
+        except (aiohttp.ClientError, TimeoutError) as error:
+            _LOGGER.debug(
+                "Could not fetch alert index, proceeding with full update: %s", error
+            )
+
+        # Отримуємо повні дані про тривоги
         try:
             res = await self.uasiren.get_alerts(self.region_id)
         except aiohttp.ClientResponseError as error:
             if error.status == 429:
                 _LOGGER.warning(
-                    "Rate limit reached for region %s. Consider increasing update interval.",
+                    "Rate limit reached for region %s (50 req/min limit). "
+                    "Consider increasing update interval.",
                     self.region_id,
                 )
             raise UpdateFailed(
@@ -198,9 +228,42 @@ class UkraineAlarmDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "last_update": current_time.isoformat(),
             "active_alerts_count": len(active_alert_types),
             "has_active_alerts": len(active_alert_types) > 0,
+            "alert_index": self._last_alert_index,
         }
 
         return current_data
+
+    def _update_durations(self) -> dict[str, Any]:
+        """Update durations for active alerts without fetching new data."""
+        if not self.data:
+            return self._create_empty_data()
+
+        current_time = dt_util.utcnow()
+        updated_data = dict(self.data)
+
+        # Оновлюємо тривалість для активних тривог
+        for alert_type in ALERT_TYPES:
+            if (
+                alert_type in self._alert_history
+                and self._alert_history[alert_type].get("active")
+            ):
+                history = self._alert_history[alert_type]
+                started_at = history["started_at"]
+                duration = (current_time - started_at).total_seconds()
+
+                updated_data[alert_type] = {
+                    "state": True,
+                    "started_at": started_at.isoformat(),
+                    "duration": int(duration),
+                    "duration_formatted": self._format_duration(duration),
+                    "last_update": history["last_update"].isoformat(),
+                }
+
+        # Оновлюємо метадані
+        if "_metadata" in updated_data:
+            updated_data["_metadata"]["last_update"] = current_time.isoformat()
+
+        return updated_data
 
     def _create_empty_data(self) -> dict[str, Any]:
         """Create empty data structure."""
@@ -218,6 +281,7 @@ class UkraineAlarmDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "last_update": dt_util.utcnow().isoformat(),
             "active_alerts_count": 0,
             "has_active_alerts": False,
+            "alert_index": self._last_alert_index,
         }
         return data
 
